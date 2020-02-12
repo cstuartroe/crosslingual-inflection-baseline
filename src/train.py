@@ -14,10 +14,10 @@ import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-import dataloader
-import model
-import util
-from model import decode_greedy
+from . import dataloader
+from . import model
+from . import util
+from .model import decode_greedy
 
 tqdm.monitor_interval = 0
 

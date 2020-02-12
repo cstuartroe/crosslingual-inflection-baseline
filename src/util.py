@@ -10,7 +10,7 @@ from functools import partial
 import numpy as np
 from tqdm import tqdm
 
-from dataloader import BOS_IDX, EOS_IDX
+from .dataloader import BOS_IDX, EOS_IDX
 
 tqdm = partial(tqdm, bar_format='{l_bar}{r_bar}')
 

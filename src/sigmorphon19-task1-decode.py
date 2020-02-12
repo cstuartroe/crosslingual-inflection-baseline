@@ -6,9 +6,9 @@ from functools import partial
 
 import torch
 
-from dataloader import BOS, EOS, UNK_IDX
-from model import decode_beam_search, decode_greedy
-from util import maybe_mkdir
+from .dataloader import BOS, EOS, UNK_IDX
+from .model import decode_beam_search, decode_greedy
+from .util import maybe_mkdir
 
 
 def get_args():

@@ -1,7 +1,6 @@
 '''
 train
 '''
-import argparse
 import glob
 import os
 import random
@@ -14,22 +13,18 @@ import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from . import dataloader
-from . import model
-from . import util
+from . import dataloader, model, util
 from .model import decode_greedy
+
+from code.timer import Timer
+train_timer = Timer.get("train")
 
 tqdm.monitor_interval = 0
 
 tqdm = partial(tqdm, bar_format='{l_bar}{r_bar}')
 
 
-class Data(util.NamedEnum):
-    sigmorphon19task1 = 'sigmorphon19task1'
-    sigmorphon19task2 = 'sigmorphon19task2'
-
-
-class Arch(util.NamedEnum):
+class Arch:
     soft = 'soft'  # soft attention without input-feeding
     hard = 'hard'  # hard attention with dynamic programming without input-feeding
     hmm = 'hmm'  # 0th-order hard attention without input-feeding
@@ -39,46 +34,13 @@ class Arch(util.NamedEnum):
 DEV = 'dev'
 TEST = 'test'
 
-
-def get_args():
-    '''
-    get_args
-    '''
-    # yapf: disable
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--dataset', required=True, type=Data, choices=list(Data))
-    parser.add_argument('--train', required=True, nargs='+')
-    parser.add_argument('--dev', required=True)
-    parser.add_argument('--test', default=None, type=str)
-    parser.add_argument('--model', required=True, help='dump model filename')
-    parser.add_argument('--load', default='', help='load model and continue training; with `smart`, recover training automatically')
-    parser.add_argument('--bs', default=20, type=int, help='training batch size')
-    parser.add_argument('--epochs', default=20, type=int, help='maximum training epochs')
-    parser.add_argument('--optimizer', default='Adam', choices=['SGD', 'Adadelta', 'Adam'])
-    parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
-    parser.add_argument('--min_lr', default=1e-5, type=float, help='minimum learning rate')
-    parser.add_argument('--momentum', default=0.9, type=float, help='momentum of SGD')
-    parser.add_argument('--estop', default=1e-8, type=float, help='early stopping criterion')
-    parser.add_argument('--cooldown', default=0, type=int, help='cooldown of `ReduceLROnPlateau`')
-    parser.add_argument('--patience', default=0, type=int, help='patience of `ReduceLROnPlateau`')
-    parser.add_argument('--discount_factor', default=0.5, type=float, help='discount factor of `ReduceLROnPlateau`')
-    parser.add_argument('--max_norm', default=0, type=float, help='gradient clipping max norm')
-    parser.add_argument('--dropout', default=0.2, type=float, help='dropout prob')
-    parser.add_argument('--embed_dim', default=100, type=int, help='embedding dimension')
-    parser.add_argument('--src_layer', default=1, type=int, help='source encoder number of layers')
-    parser.add_argument('--trg_layer', default=1, type=int, help='target decoder number of layers')
-    parser.add_argument('--src_hs', default=200, type=int, help='source encoder hidden dimension')
-    parser.add_argument('--trg_hs', default=200, type=int, help='target decoder hidden dimension')
-    parser.add_argument('--arch', required=True, type=Arch, choices=list(Arch))
-    parser.add_argument('--wid_siz', default=11, type=int, help='maximum transition in 1st-order hard attention')
-    parser.add_argument('--loglevel', default='info', choices=['info', 'debug'])
-    parser.add_argument('--saveall', default=False, action='store_true', help='keep all models')
-    parser.add_argument('--mono', default=False, action='store_true', help='enforce monotonicity')
-    parser.add_argument('--bestacc', default=False, action='store_true', help='select model by accuracy only')
-    parser.add_argument('--shuffle', default=False, action='store_true', help='shuffle the data')
-    # yapf: enable
-    return parser.parse_args()
+model_classfactory = {
+    (Arch.soft, False): model.TagTransducer,
+    (Arch.hard, False): model.TagHardAttnTransducer,
+    (Arch.hmm, True): model.MonoTagHMMTransducer,
+    (Arch.hmmfull, False): model.TagFullHMMTransducer,
+    (Arch.hmmfull, True): model.MonoTagFullHMMTransducer
+}
 
 
 class Trainer(object):
@@ -88,8 +50,9 @@ class Trainer(object):
         super().__init__()
         self.logger = logger
         self.data = None
-        self.device = torch.device("cuda" if torch.cuda.
-                                   is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available()
+                                   else "cpu")
+        print("device", self.device)
         self.model = None
         self.optimizer = None
         self.min_lr = 0
@@ -98,51 +61,35 @@ class Trainer(object):
         self.last_devloss = float('inf')
         self.models = list()
 
-    def load_data(self, dataset, train, dev, test=None, shuffle=False):
+    def load_data(self, source_lang, target_lang, test=None, shuffle=False):
         assert self.data is None
         logger = self.logger
         # yapf: disable
-        if dataset == Data.sigmorphon19task1:
-            assert isinstance(train, list) and len(train) == 2
-            self.data = dataloader.TagSIGMORPHON2019Task1(train, dev, test, shuffle)
-        elif dataset == Data.sigmorphon19task2:
-            assert isinstance(train, list) and len(train) == 1
-            self.data = dataloader.TagSIGMORPHON2019Task2(train, dev, test, shuffle)
-        else:
-            raise ValueError
+        self.data = dataloader.TagSIGMORPHON2019Task1(source_lang=source_lang, target_lang=target_lang,
+                                                      test=test, shuffle=shuffle)
         # yapf: enable
         logger.info('src vocab size %d', self.data.source_vocab_size)
         logger.info('trg vocab size %d', self.data.target_vocab_size)
         logger.info('src vocab %r', self.data.source[:500])
         logger.info('trg vocab %r', self.data.target[:500])
 
-    def build_model(self, opt):
+    def build_model(self, embed_dim, dropout, src_hs, trg_hs, src_layer, trg_layer, wid_siz, arch, mono):
         assert self.model is None
         params = dict()
         params['src_vocab_size'] = self.data.source_vocab_size
         params['trg_vocab_size'] = self.data.target_vocab_size
-        params['embed_dim'] = opt.embed_dim
-        params['dropout_p'] = opt.dropout
-        params['src_hid_size'] = opt.src_hs
-        params['trg_hid_size'] = opt.trg_hs
-        params['src_nb_layers'] = opt.src_layer
-        params['trg_nb_layers'] = opt.trg_layer
+        params['embed_dim'] = embed_dim
+        params['dropout_p'] = dropout
+        params['src_hid_size'] = src_hs
+        params['trg_hid_size'] = trg_hs
+        params['src_nb_layers'] = src_layer
+        params['trg_nb_layers'] = trg_layer
         params['nb_attr'] = self.data.nb_attr
-        params['wid_siz'] = opt.wid_siz
+        params['wid_siz'] = wid_siz
         params['src_c2i'] = self.data.source_c2i
         params['trg_c2i'] = self.data.target_c2i
         params['attr_c2i'] = self.data.attr_c2i
-        mono = True
-        # yapf: disable
-        model_classfactory = {
-            (Arch.soft, not mono): model.TagTransducer,
-            (Arch.hard, not mono): model.TagHardAttnTransducer,
-            (Arch.hmm, mono): model.MonoTagHMMTransducer,
-            (Arch.hmmfull, not mono): model.TagFullHMMTransducer,
-            (Arch.hmmfull, mono): model.MonoTagFullHMMTransducer
-        }
-        # yapf: enable
-        model_class = model_classfactory[(opt.arch, opt.mono)]
+        model_class = model_classfactory[(arch, mono)]
         self.model = model_class(**params)
         self.logger.info('number of attribute %d', self.model.nb_attr)
         self.logger.info('dec 1st rnn %r', self.model.dec_rnn.layers[0])
@@ -207,30 +154,42 @@ class Trainer(object):
     def load_training(self, model_fp):
         assert self.model is not None
         optimizer_state, scheduler_state = torch.load(
-            open(f'{model_fp}.progress', 'rb'))
+            open(f'{model_fp}/model.progress', 'rb'))
         self.optimizer.load_state_dict(optimizer_state)
         self.scheduler.load_state_dict(scheduler_state)
 
     def setup_evalutator(self):
         self.evaluator = util.BasicEvaluator()
 
-    def train(self, epoch_idx, batch_size, max_norm):
+    def train(self, epoch_idx, batch_size, max_norm, pre=False):
         logger, model, data = self.logger, self.model, self.data
+        if pre:
+            batch_sample = data.pretrain_batch_sample
+            nb_batch = ceil(data.nb_pretrain / batch_size)
+        else:
+            batch_sample = data.train_batch_sample
+            nb_batch = ceil(data.nb_train / batch_size)
+
         logger.info('At %d-th epoch with lr %f.', epoch_idx,
                     self.optimizer.param_groups[0]['lr'])
         model.train()
-        nb_train_batch = ceil(data.nb_train / batch_size)
-        for src, src_mask, trg, _ in tqdm(
-                data.train_batch_sample(batch_size), total=nb_train_batch):
+        print("train", epoch_idx)
+        for src, src_mask, trg, _ in tqdm(batch_sample(batch_size), total=nb_batch):
+            train_timer.task("out")
             out = model(src, src_mask, trg)
+            train_timer.task("loss")
             loss = model.loss(out, trg[1:])
+            train_timer.task("zero grad")
             self.optimizer.zero_grad()
+            train_timer.task("backward")
             loss.backward()
             if max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             logger.debug('loss %f with total grad norm %f', loss,
                          util.grad_norm(model.parameters()))
+            train_timer.task("opt")
             self.optimizer.step()
+        train_timer.report()
 
     def iterate_batch(self, mode, batch_size):
         if mode == 'dev':
@@ -350,56 +309,122 @@ class Trainer(object):
         os.remove(f'{model_fp}.progress')
 
 
-def main():
-    '''
-    main
-    '''
-    opt = get_args()
-    util.maybe_mkdir(opt.model)
-    logger = util.get_logger(opt.model + '.log', log_level=opt.loglevel)
-    for key, value in vars(opt).items():
-        logger.info('command line argument: %s - %r', key, value)
-    random.seed(opt.seed)
-    np.random.seed(opt.seed)
-    torch.manual_seed(opt.seed)
+def main(
+    source_lang,
+    target_lang,
+    loglevel="info",
+    seed=0,
+    test=None,
+    shuffle=True,
+    embed_dim=20,
+    src_hs=400,
+    trg_hs=400,
+    dropout=0.4,
+    src_layer=2,
+    trg_layer=1,
+    max_norm=5,
+    arch="hard",
+    estop=1e-8,
+    pretrain_epochs=1000,
+    train_epochs=1000,
+    bs=20,
+    patience=10,
+    wid_siz=11,
+    mono=False,
+    optimizer="Adam",
+    lr=1e-3,
+    momentum=0.9,
+    min_lr=1e-5,
+    cooldown=0,
+    discount_factor=.5,
+    bestacc=False,
+    saveall=False):
+
+    pretrain_model_dir = f"model/tag-{arch}/{source_lang}" if source_lang else None
+    train_model_dir = pretrain_model_dir + "-" + target_lang if source_lang else f"model/tag-{arch}/none-{target_lang}"
+
+    if source_lang and not os.path.exists(pretrain_model_dir):
+        os.makedirs(pretrain_model_dir)
+    if not os.path.exists(train_model_dir):
+        os.makedirs(train_model_dir)
+
+    logger = util.get_logger(os.path.join("logs", f'{source_lang}-{target_lang}.log'), log_level=loglevel)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(opt.seed)
+        torch.cuda.manual_seed_all(seed)
 
     trainer = Trainer(logger)
-    trainer.load_data(opt.dataset, opt.train, opt.dev, test=opt.test, shuffle=opt.shuffle)
+    trainer.load_data(source_lang=source_lang, target_lang=target_lang, test=test, shuffle=shuffle)
     trainer.setup_evalutator()
-    if opt.load and opt.load != '0':
-        if os.path.isfile(opt.load):
-            start_epoch = trainer.load_model(opt.load) + 1
-        elif opt.load == 'smart':
-            start_epoch = trainer.smart_load_model(opt.model) + 1
-        else:
-            raise ValueError
-        logger.info('continue training from epoch %d', start_epoch)
-        trainer.setup_training(opt.optimizer, opt.lr, opt.momentum)
-        trainer.setup_scheduler(opt.min_lr, opt.patience, opt.cooldown,
-                                opt.discount_factor)
-        trainer.load_training(opt.model)
+
+    pretrain_model_filenames = [f for f in os.listdir(pretrain_model_dir) if not f.endswith(".progress")] if source_lang else None
+    train_model_filenames = [f for f in os.listdir(train_model_dir) if not f.endswith(".progress")]
+
+    if len(train_model_filenames) > 0:
+        train_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
+        furthest_model = train_model_filenames[-1]
+        pretrain_start_epoch = pretrain_epochs
+        train_start_epoch = trainer.smart_load_model(os.path.join(train_model_dir, "model")) + 1
+
+        logger.info('continue training from epoch %d', train_start_epoch)
+        trainer.setup_training(optimizer, lr, momentum)
+        trainer.setup_scheduler(min_lr, patience, cooldown, discount_factor)
+        trainer.load_training(train_model_dir)
+
+    elif source_lang and len(pretrain_model_filenames) > 0:
+        pretrain_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
+        furthest_model = pretrain_model_filenames[-1]
+        pretrain_start_epoch = trainer.smart_load_model(os.path.join(pretrain_model_dir, "model")) + 1
+        train_start_epoch = 0
+
+        logger.info('continue pretraining from epoch %d', pretrain_start_epoch)
+        trainer.setup_training(optimizer, lr, momentum)
+        trainer.setup_scheduler(min_lr, patience, cooldown, discount_factor)
+        trainer.load_training(pretrain_model_dir)
+
     else:
-        start_epoch = 0
-        trainer.build_model(opt)
-        trainer.setup_training(opt.optimizer, opt.lr, opt.momentum)
-        trainer.setup_scheduler(opt.min_lr, opt.patience, opt.cooldown,
-                                opt.discount_factor)
+        logger.info("Creating model from scratch")
+        pretrain_start_epoch = 0 if source_lang else pretrain_epochs
+        train_start_epoch = 0
+        trainer.build_model(
+            embed_dim=embed_dim,
+            dropout=dropout,
+            src_hs=src_hs,
+            trg_hs=trg_hs,
+            src_layer=src_layer,
+            trg_layer=trg_layer,
+            wid_siz=wid_siz,
+            arch=arch,
+            mono=mono)
+        trainer.setup_training(optimizer, lr, momentum)
+        trainer.setup_scheduler(min_lr, patience, cooldown, discount_factor)
 
-    for epoch_idx in range(start_epoch, start_epoch + opt.epochs):
-        trainer.train(epoch_idx, opt.bs, opt.max_norm)
+    for epoch_idx in range(pretrain_start_epoch, pretrain_epochs):
+        trainer.train(epoch_idx, bs, max_norm, pre=True)
         with torch.no_grad():
-            devloss = trainer.calc_loss(DEV, opt.bs, epoch_idx)
+            devloss = trainer.calc_loss(DEV, bs, epoch_idx)
             eval_res = trainer.evaluate(DEV, epoch_idx)
-        if trainer.update_lr_and_stop_early(epoch_idx, devloss, opt.estop):
+        if trainer.update_lr_and_stop_early(epoch_idx, devloss, estop):
             break
-        trainer.save_model(epoch_idx, devloss, eval_res, opt.model)
-        trainer.save_training(opt.model)
+        fp = os.path.join(pretrain_model_dir, "model")
+        trainer.save_model(epoch_idx, devloss, eval_res, fp)
+        trainer.save_training(fp)
+
+    for epoch_idx in range(train_start_epoch, train_epochs):
+        trainer.train(epoch_idx, bs, max_norm, pre=False)
+        with torch.no_grad():
+            devloss = trainer.calc_loss(DEV, bs, epoch_idx)
+            eval_res = trainer.evaluate(DEV, epoch_idx)
+        if trainer.update_lr_and_stop_early(epoch_idx, devloss, estop):
+            break
+        fp = os.path.join(train_model_dir, "model")
+        trainer.save_model(epoch_idx, devloss, eval_res, fp)
+        trainer.save_training(fp)
+
     with torch.no_grad():
-        save_fps = trainer.reload_and_test(opt.model, opt.bs, opt.bestacc)
-    trainer.cleanup(opt.saveall, save_fps, opt.model)
+        save_fps = trainer.reload_and_test(os.path.join(train_model_dir, "model"), bs, bestacc)
 
-
-if __name__ == '__main__':
-    main()
+    # trainer.cleanup(saveall, save_fps, os.path.join(train_model_dir, "model"))

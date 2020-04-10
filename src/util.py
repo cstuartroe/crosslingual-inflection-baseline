@@ -64,7 +64,7 @@ def get_logger(log_file, log_level='info'):
     assert log_level in ['info', 'debug']
     fmt = '%(asctime)s %(levelname)s: %(message)s'
     datefmt = '%Y-%m-%d %H:%M:%S'
-    logger = logging.getLogger()
+    logger = logging.getLogger(log_file)
     log_level = {'info': logging.INFO, 'debug': logging.DEBUG}[log_level]
     logger.setLevel(log_level)
 

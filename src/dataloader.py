@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import os
 
 from tqdm import tqdm
 
@@ -16,8 +17,42 @@ EOS_IDX = 2
 UNK_IDX = 3
 
 
+def read_file(file):
+    if 'train' in file:
+        lang_tag = [file.split('/')[-1].split('-train')[0]]
+    elif 'dev' in file:
+        lang_tag = [file.split('/')[-1].split('-dev')[0]]
+    else:
+        raise ValueError
+    with open(file, 'r', encoding='utf-8') as fp:
+        for line in fp.readlines():
+            lemma, word, tags = line.strip().split('\t')
+            yield list(lemma), list(word), lang_tag + tags.split(';')
+
+
+def build_global_vocab(langs):
+    char_set, tag_set = set(), set()
+
+    for lang in langs:
+        files = [os.path.join("conll2018/task1/all", file) for file in
+                 [f"{lang}-train-high", f"{lang}-train-low"]  # , f"{lang}-dev"]
+                 if file in os.listdir("conll2018/task1/all")]
+        for file in files:
+            for lemma, word, tags in read_file(file):
+                char_set.update(lemma)
+                char_set.update(word)
+                tag_set.update(tags)
+
+    chars = sorted(list(char_set))
+    tags = sorted(list(tag_set))
+    source = [PAD, BOS, EOS, UNK] + chars + tags
+    target = [PAD, BOS, EOS, UNK] + chars
+
+    return source, target
+
+
 class TagSIGMORPHON2019Task1:
-    def __init__(self, source_lang, target_lang, test=True, shuffle=False):
+    def __init__(self, source_lang, target_lang, src_vocab, trg_vocab, test=True, shuffle=False):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # assert os.path.isfile(train_file)
         # assert os.path.isfile(dev_file)
@@ -28,9 +63,9 @@ class TagSIGMORPHON2019Task1:
         self.test_file = f"conll2018/task1/all/{target_lang}-test" if test else None
         self.shuffle = shuffle
         self.batch_data = dict()
-        self.nb_pretrain, self.nb_train, self.nb_dev, self.nb_test = 0, 0, 0, 0
-        self.nb_attr = 0
-        self.source, self.target = self.build_vocab()
+        self.source, self.target = src_vocab, trg_vocab
+        self.file_sizes()
+        self.nb_attr = len(src_vocab) - len(trg_vocab)
         self.source_vocab_size = len(self.source)
         self.target_vocab_size = len(self.target)
         if self.nb_attr > 0:
@@ -115,52 +150,17 @@ class TagSIGMORPHON2019Task1:
             sent = sent.view(-1)
         return [self.target[x] for x in sent]
 
-    def build_vocab(self):
-        char_set, tag_set = set(), set()
-
-        cnt = 0
-        if self.pretrain_file:
-            for lemma, word, tags in self.read_file(self.pretrain_file):
-                cnt += 1
-                char_set.update(lemma)
-                char_set.update(word)
-                tag_set.update(tags)
-            self.nb_pretrain = cnt
-
-        cnt = 0
-        for lemma, word, tags in self.read_file(self.train_file):
-            cnt += 1
-            char_set.update(lemma)
-            char_set.update(word)
-            tag_set.update(tags)
-        self.nb_train = cnt
-
-        self.nb_dev = sum([1 for _ in self.read_file(self.dev_file)])
+    def file_sizes(self):
+        if self.pretrain_file is None:
+            self.nb_pretrain = 0
+        else:
+            self.nb_pretrain = sum([1 for _ in read_file(self.pretrain_file)])
+        self.nb_train = sum([1 for _ in read_file(self.train_file)])
+        self.nb_dev = sum([1 for _ in read_file(self.dev_file)])
         if self.test_file is None:
             self.nb_test = 0
         else:
-            self.nb_test = sum([1 for _ in self.read_file(self.test_file)])
-
-        chars = sorted(list(char_set))
-        tags = sorted(list(tag_set))
-        self.nb_attr = len(tags)
-        source = [PAD, BOS, EOS, UNK] + chars + tags
-        target = [PAD, BOS, EOS, UNK] + chars
-
-        return source, target
-
-    @staticmethod
-    def read_file(file):
-        if 'train' in file:
-            lang_tag = [file.split('/')[-1].split('-train')[0]]
-        elif 'dev' in file:
-            lang_tag = [file.split('/')[-1].split('-dev')[0]]
-        else:
-            raise ValueError
-        with open(file, 'r', encoding='utf-8') as fp:
-            for line in fp.readlines():
-                lemma, word, tags = line.strip().split('\t')
-                yield list(lemma), list(word), lang_tag + tags.split(';')
+            self.nb_test = sum([1 for _ in read_file(self.test_file)])
 
     def _iter_helper(self, file):
         tag_shift = len(self.source) - self.nb_attr
@@ -168,7 +168,7 @@ class TagSIGMORPHON2019Task1:
             file = [file]
         for fp in file:
             i = 0
-            for lemma, word, tags in self.read_file(fp):
+            for lemma, word, tags in read_file(fp):
                 i += 1
                 src = []
                 src.append(self.source_c2i[BOS])

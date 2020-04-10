@@ -186,7 +186,14 @@ class Transducer(nn.Module):
         only for training
         '''
         # trg_seq_len, batch_size = trg_batch.size()
+        # try:
         enc_hs = self.encode(src_batch)
+        # except RuntimeError as e:
+        #     print("forwarding error")
+        #     print(src_batch[0].size(), src_batch[1].size())
+        #     print(src_mask.size())
+        #     print(trg_batch.size())
+        #     raise e
         # output: [trg_seq_len-1, batch_size, vocab_siz]
         output = self.decode(enc_hs, src_mask, trg_batch)
         return output

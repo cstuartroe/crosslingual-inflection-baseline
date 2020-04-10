@@ -61,12 +61,13 @@ class Trainer(object):
         self.last_devloss = float('inf')
         self.models = list()
 
-    def load_data(self, source_lang, target_lang, test=None, shuffle=False):
+    def load_data(self, source_lang, target_lang, src_vocab, trg_vocab, test=None, shuffle=False):
         assert self.data is None
         logger = self.logger
         # yapf: disable
         self.data = dataloader.TagSIGMORPHON2019Task1(source_lang=source_lang, target_lang=target_lang,
-                                                      test=test, shuffle=shuffle)
+                                                      test=test, shuffle=shuffle, src_vocab=src_vocab,
+                                                      trg_vocab=trg_vocab)
         # yapf: enable
         logger.info('src vocab size %d', self.data.source_vocab_size)
         logger.info('trg vocab size %d', self.data.target_vocab_size)
@@ -173,9 +174,10 @@ class Trainer(object):
         logger.info('At %d-th epoch with lr %f.', epoch_idx,
                     self.optimizer.param_groups[0]['lr'])
         model.train()
-        print("train", epoch_idx)
+        print(f"{'pre' if pre else '' }train", epoch_idx)
         for src, src_mask, trg, _ in tqdm(batch_sample(batch_size), total=nb_batch):
             train_timer.task("out")
+            # print(src, src_mask, trg)
             out = model(src, src_mask, trg)
             train_timer.task("loss")
             loss = model.loss(out, trg[1:])
@@ -309,122 +311,140 @@ class Trainer(object):
         os.remove(f'{model_fp}.progress')
 
 
-def main(
-    source_lang,
-    target_lang,
-    loglevel="info",
-    seed=0,
-    test=None,
-    shuffle=True,
-    embed_dim=20,
-    src_hs=400,
-    trg_hs=400,
-    dropout=0.4,
-    src_layer=2,
-    trg_layer=1,
-    max_norm=5,
-    arch="hard",
-    estop=1e-8,
-    pretrain_epochs=1000,
-    train_epochs=1000,
-    bs=20,
-    patience=10,
-    wid_siz=11,
-    mono=False,
-    optimizer="Adam",
-    lr=1e-3,
-    momentum=0.9,
-    min_lr=1e-5,
-    cooldown=0,
-    discount_factor=.5,
-    bestacc=False,
-    saveall=False):
+class Multitrainer:
+    INSTANCE_PARAMS = {
+        "langs": set(),
+        "loglevel": "info",
+        "seed": 0,
+        "shuffle": True,
+        "embed_dim": 20,
+        "src_hs": 400,
+        "trg_hs": 400,
+        "dropout": 0.4,
+        "src_layer": 2,
+        "trg_layer": 1,
+        "max_norm": 5,
+        "arch": "hard",
+        "estop": 1e-8,
+        "pretrain_epochs": 1000,
+        "train_epochs": 1000,
+        "bs": 20,
+        "patience": 10,
+        "wid_siz": 11,
+        "mono": False,
+        "optimizer": "Adam",
+        "lr": 1e-3,
+        "momentum": 0.9,
+        "min_lr": 1e-5,
+        "cooldown": 0,
+        "discount_factor": .5,
+        "bestacc": False,
+        "saveall": False
+    }
 
-    pretrain_model_dir = f"model/tag-{arch}/{source_lang}" if source_lang else None
-    train_model_dir = pretrain_model_dir + "-" + target_lang if source_lang else f"model/tag-{arch}/none-{target_lang}"
+    def __init__(self, **kwargs):
+        # a shortcut way of setting a ton of instance variables
+        self.__dict__.update(Multitrainer.INSTANCE_PARAMS)
+        assert(set(kwargs.keys()).issubset(set(Multitrainer.INSTANCE_PARAMS.keys())))
+        self.__dict__.update(kwargs)
 
-    if source_lang and not os.path.exists(pretrain_model_dir):
-        os.makedirs(pretrain_model_dir)
-    if not os.path.exists(train_model_dir):
-        os.makedirs(train_model_dir)
+        self.src_vocab, self.trg_vocab = dataloader.build_global_vocab(self.langs)
 
-    logger = util.get_logger(os.path.join("logs", f'{source_lang}-{target_lang}.log'), log_level=loglevel)
+    def train_pair(self, source_lang, target_lang, test=None):
+        logger = util.get_logger(os.path.join("logs", f'{source_lang}-{target_lang}.log'), log_level=self.loglevel)
+        logger.info(f"Source lang: {source_lang}, Target lang: {target_lang}")
 
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        assert(source_lang is None or source_lang in self.langs)
+        assert(target_lang in self.langs)
+        pretrain_model_dir = f"model/tag-{self.arch}/{source_lang}" if source_lang else None
+        train_model_dir = pretrain_model_dir + "-" + target_lang if source_lang else f"model/tag-{self.arch}/none-{target_lang}"
 
-    trainer = Trainer(logger)
-    trainer.load_data(source_lang=source_lang, target_lang=target_lang, test=test, shuffle=shuffle)
-    trainer.setup_evalutator()
+        if source_lang and not os.path.exists(pretrain_model_dir):
+            os.makedirs(pretrain_model_dir)
+        if not os.path.exists(train_model_dir):
+            os.makedirs(train_model_dir)
 
-    pretrain_model_filenames = [f for f in os.listdir(pretrain_model_dir) if not f.endswith(".progress")] if source_lang else None
-    train_model_filenames = [f for f in os.listdir(train_model_dir) if not f.endswith(".progress")]
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
 
-    if len(train_model_filenames) > 0:
-        train_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
-        furthest_model = train_model_filenames[-1]
-        pretrain_start_epoch = pretrain_epochs
-        train_start_epoch = trainer.smart_load_model(os.path.join(train_model_dir, "model")) + 1
+        trainer = Trainer(logger)
+        trainer.load_data(source_lang=source_lang, target_lang=target_lang, test=test, shuffle=self.shuffle,
+                          src_vocab=self.src_vocab, trg_vocab=self.trg_vocab)
+        trainer.setup_evalutator()
 
-        logger.info('continue training from epoch %d', train_start_epoch)
-        trainer.setup_training(optimizer, lr, momentum)
-        trainer.setup_scheduler(min_lr, patience, cooldown, discount_factor)
-        trainer.load_training(train_model_dir)
+        pretrain_model_filenames = [f for f in os.listdir(pretrain_model_dir) if re.fullmatch(r"model\.nll.+epoch_\d+", f)] if source_lang else None
+        train_model_filenames = [f for f in os.listdir(train_model_dir) if re.fullmatch(r"model\.nll.+epoch_\d+", f)]
 
-    elif source_lang and len(pretrain_model_filenames) > 0:
-        pretrain_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
-        furthest_model = pretrain_model_filenames[-1]
-        pretrain_start_epoch = trainer.smart_load_model(os.path.join(pretrain_model_dir, "model")) + 1
-        train_start_epoch = 0
+        if len(train_model_filenames) > 0:
+            print(train_model_filenames)
+            train_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
+            furthest_model = train_model_filenames[-1]
+            pretrain_start_epoch = self.pretrain_epochs
+            train_start_epoch = trainer.smart_load_model(os.path.join(train_model_dir, "model")) + 1
 
-        logger.info('continue pretraining from epoch %d', pretrain_start_epoch)
-        trainer.setup_training(optimizer, lr, momentum)
-        trainer.setup_scheduler(min_lr, patience, cooldown, discount_factor)
-        trainer.load_training(pretrain_model_dir)
+            logger.info('continue training from epoch %d', train_start_epoch)
+            trainer.setup_training(self.optimizer, self.lr, self.momentum)
+            trainer.setup_scheduler(self.min_lr, self.patience, self.cooldown, self.discount_factor)
+            trainer.load_training(train_model_dir)
 
-    else:
-        logger.info("Creating model from scratch")
-        pretrain_start_epoch = 0 if source_lang else pretrain_epochs
-        train_start_epoch = 0
-        trainer.build_model(
-            embed_dim=embed_dim,
-            dropout=dropout,
-            src_hs=src_hs,
-            trg_hs=trg_hs,
-            src_layer=src_layer,
-            trg_layer=trg_layer,
-            wid_siz=wid_siz,
-            arch=arch,
-            mono=mono)
-        trainer.setup_training(optimizer, lr, momentum)
-        trainer.setup_scheduler(min_lr, patience, cooldown, discount_factor)
+        elif source_lang and len(pretrain_model_filenames) > 0:
+            pretrain_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
+            furthest_model = pretrain_model_filenames[-1]
+            pretrain_start_epoch = trainer.smart_load_model(os.path.join(pretrain_model_dir, "model")) + 1
+            train_start_epoch = 0
 
-    for epoch_idx in range(pretrain_start_epoch, pretrain_epochs):
-        trainer.train(epoch_idx, bs, max_norm, pre=True)
+            logger.info('continue pretraining from epoch %d', pretrain_start_epoch)
+            trainer.setup_training(self.optimizer, self.lr, self.momentum)
+            trainer.setup_scheduler(self.min_lr, self.patience, self.cooldown, self.discount_factor)
+            trainer.load_training(pretrain_model_dir)
+
+        else:
+            print(source_lang)
+            print(os.listdir(pretrain_model_dir))
+            print([re.fullmatch(r"model\.nll.+epoch_\d+", f) for f in os.listdir(pretrain_model_dir)])
+            print(pretrain_model_filenames)
+            logger.info("Creating model from scratch")
+            pretrain_start_epoch = 0 if source_lang else self.pretrain_epochs
+            train_start_epoch = 0
+            trainer.build_model(
+                embed_dim=self.embed_dim,
+                dropout=self.dropout,
+                src_hs=self.src_hs,
+                trg_hs=self.trg_hs,
+                src_layer=self.src_layer,
+                trg_layer=self.trg_layer,
+                wid_siz=self.wid_siz,
+                arch=self.arch,
+                mono=self.mono)
+            trainer.setup_training(self.optimizer, self.lr, self.momentum)
+            trainer.setup_scheduler(self.min_lr, self.patience, self.cooldown, self.discount_factor)
+
+        for epoch_idx in range(pretrain_start_epoch, self.pretrain_epochs):
+            trainer.train(epoch_idx, self.bs, self.max_norm, pre=True)
+            with torch.no_grad():
+                devloss = trainer.calc_loss(DEV, self.bs, epoch_idx)
+                eval_res = trainer.evaluate(DEV, epoch_idx)
+            if trainer.update_lr_and_stop_early(epoch_idx, devloss, self.estop):
+                break
+            fp = os.path.join(pretrain_model_dir, "model")
+            trainer.save_model(epoch_idx, devloss, eval_res, fp)
+            trainer.save_training(fp)
+
+        for epoch_idx in range(train_start_epoch, self.train_epochs):
+            trainer.train(epoch_idx, self.bs, self.max_norm, pre=False)
+            with torch.no_grad():
+                devloss = trainer.calc_loss(DEV, self.bs, epoch_idx)
+                eval_res = trainer.evaluate(DEV, epoch_idx)
+            if trainer.update_lr_and_stop_early(epoch_idx, devloss, self.estop):
+                break
+            fp = os.path.join(train_model_dir, "model")
+            trainer.save_model(epoch_idx, devloss, eval_res, fp)
+            trainer.save_training(fp)
+
         with torch.no_grad():
-            devloss = trainer.calc_loss(DEV, bs, epoch_idx)
-            eval_res = trainer.evaluate(DEV, epoch_idx)
-        if trainer.update_lr_and_stop_early(epoch_idx, devloss, estop):
-            break
-        fp = os.path.join(pretrain_model_dir, "model")
-        trainer.save_model(epoch_idx, devloss, eval_res, fp)
-        trainer.save_training(fp)
+            save_fps = trainer.reload_and_test(os.path.join(train_model_dir, "model"), self.bs, self.bestacc)
 
-    for epoch_idx in range(train_start_epoch, train_epochs):
-        trainer.train(epoch_idx, bs, max_norm, pre=False)
-        with torch.no_grad():
-            devloss = trainer.calc_loss(DEV, bs, epoch_idx)
-            eval_res = trainer.evaluate(DEV, epoch_idx)
-        if trainer.update_lr_and_stop_early(epoch_idx, devloss, estop):
-            break
-        fp = os.path.join(train_model_dir, "model")
-        trainer.save_model(epoch_idx, devloss, eval_res, fp)
-        trainer.save_training(fp)
-
-    with torch.no_grad():
-        save_fps = trainer.reload_and_test(os.path.join(train_model_dir, "model"), bs, bestacc)
-
-    # trainer.cleanup(saveall, save_fps, os.path.join(train_model_dir, "model"))
+        # trainer.cleanup(saveall, save_fps, os.path.join(train_model_dir, "model"))

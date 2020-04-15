@@ -19,15 +19,17 @@ UNK_IDX = 3
 
 def read_file(file):
     if 'train' in file:
-        lang_tag = [file.split('/')[-1].split('-train')[0]]
+        lang_tag = file.split('/')[-1].split('-train')[0]
     elif 'dev' in file:
-        lang_tag = [file.split('/')[-1].split('-dev')[0]]
+        lang_tag = file.split('/')[-1].split('-dev')[0]
+    elif 'test' in file:
+        lang_tag = file.split('/')[-1].split('-test')[0]
     else:
         raise ValueError
     with open(file, 'r', encoding='utf-8') as fp:
         for line in fp.readlines():
             lemma, word, tags = line.strip().split('\t')
-            yield list(lemma), list(word), lang_tag + tags.split(';')
+            yield list(lemma), list(word), [lang_tag] + tags.split(';')
 
 
 def build_global_vocab(langs):
@@ -35,7 +37,7 @@ def build_global_vocab(langs):
 
     for lang in langs:
         files = [os.path.join("conll2018/task1/all", file) for file in
-                 [f"{lang}-train-high", f"{lang}-train-low"]  # , f"{lang}-dev"]
+                 [f"{lang}-train-high", f"{lang}-train-medium", f"{lang}-dev", f"{lang}-test"]
                  if file in os.listdir("conll2018/task1/all")]
         for file in files:
             for lemma, word, tags in read_file(file):
@@ -58,9 +60,11 @@ class TagSIGMORPHON2019Task1:
         # assert os.path.isfile(dev_file)
         # assert test_file is None or os.path.isfile(test_file)
         self.pretrain_file = f"conll2018/task1/all/{source_lang}-train-high" if source_lang else None
-        self.train_file = f"conll2018/task1/all/{target_lang}-train-low"
-        self.dev_file = f"conll2018/task1/all/{target_lang}-dev"
+        self.pretrain_dev_file = f"conll2018/task1/all/{source_lang}-dev" if source_lang else None
+        self.train_file = f"conll2018/task1/all/{target_lang}-train-medium"
+        self.train_dev_file = f"conll2018/task1/all/{target_lang}-dev"
         self.test_file = f"conll2018/task1/all/{target_lang}-test" if test else None
+
         self.shuffle = shuffle
         self.batch_data = dict()
         self.source, self.target = src_vocab, trg_vocab
@@ -115,11 +119,14 @@ class TagSIGMORPHON2019Task1:
     def pretrain_batch_sample(self, batch_size):
         yield from self._batch_sample(batch_size, self.pretrain_file)
 
+    def pretrain_dev_batch_sample(self, batch_size):
+        yield from self._batch_sample(batch_size, self.pretrain_dev_file)
+
     def train_batch_sample(self, batch_size):
         yield from self._batch_sample(batch_size, self.train_file)
 
-    def dev_batch_sample(self, batch_size):
-        yield from self._batch_sample(batch_size, self.dev_file)
+    def train_dev_batch_sample(self, batch_size):
+        yield from self._batch_sample(batch_size, self.train_dev_file)
 
     def test_batch_sample(self, batch_size):
         yield from self._batch_sample(batch_size, self.test_file)
@@ -153,10 +160,14 @@ class TagSIGMORPHON2019Task1:
     def file_sizes(self):
         if self.pretrain_file is None:
             self.nb_pretrain = 0
+            self.nb_pretrain_dev = 0
         else:
             self.nb_pretrain = sum([1 for _ in read_file(self.pretrain_file)])
+            self.nb_pretrain_dev = sum([1 for _ in read_file(self.pretrain_dev_file)])
+
         self.nb_train = sum([1 for _ in read_file(self.train_file)])
-        self.nb_dev = sum([1 for _ in read_file(self.dev_file)])
+        self.nb_train_dev = sum([1 for _ in read_file(self.train_dev_file)])
+
         if self.test_file is None:
             self.nb_test = 0
         else:
@@ -231,14 +242,20 @@ class TagSIGMORPHON2019Task1:
                     torch.tensor(tags, device=self.device).view(1, len(tags))),
                    torch.tensor(trg, device=self.device).view(len(trg), 1))
 
+    def pretrain_dev_sample(self):
+        for src, trg, tags in self._iter_helper(self.pretrain_dev_file):
+            yield ((torch.tensor(src, device=self.device).view(len(src), 1),
+                    torch.tensor(tags, device=self.device).view(1, len(tags))),
+                   torch.tensor(trg, device=self.device).view(len(trg), 1))
+
     def train_sample(self):
         for src, trg, tags in self._iter_helper(self.train_file):
             yield ((torch.tensor(src, device=self.device).view(len(src), 1),
                     torch.tensor(tags, device=self.device).view(1, len(tags))),
                    torch.tensor(trg, device=self.device).view(len(trg), 1))
 
-    def dev_sample(self):
-        for src, trg, tags in self._iter_helper(self.dev_file):
+    def train_dev_sample(self):
+        for src, trg, tags in self._iter_helper(self.train_dev_file):
             yield ((torch.tensor(src, device=self.device).view(len(src), 1),
                     torch.tensor(tags, device=self.device).view(1, len(tags))),
                    torch.tensor(trg, device=self.device).view(len(trg), 1))

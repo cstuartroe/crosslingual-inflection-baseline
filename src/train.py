@@ -49,7 +49,7 @@ class Trainer(object):
     def __init__(self, logger):
         super().__init__()
         self.logger = logger
-        self.data = None
+        self.data: dataloader.TagSIGMORPHON2019Task1 = None
         self.device = torch.device("cuda" if torch.cuda.is_available()
                                    else "cpu")
         print("device", self.device)
@@ -106,21 +106,10 @@ class Trainer(object):
         epoch = int(model.split('_')[-1])
         return epoch
 
-    def smart_load_model(self, model_prefix):
+    def smart_load_model(self, model_dir):
         assert self.model is None
-        models = []
-        for model in glob.glob(f'{model_prefix}.nll*'):
-            res = re.findall(r'\w*_\d+\.?\d*', model)
-            loss_, evals_, epoch_ = res[0].split('_'), res[1:-1], res[-1].split('_')
-            assert loss_[0] == 'nll' and epoch_[0] == 'epoch'
-            loss, epoch = float(loss_[1]), int(epoch_[1])
-            evals = []
-            for ev in evals_:
-                ev = ev.split('_')
-                evals.append(util.Eval(ev[0], ev[0], float(ev[1])))
-            models.append((epoch, (model, loss, evals)))
-        self.models = [x[1] for x in sorted(models)]
-        return self.load_model(self.models[-1][0])
+        furthest_model, self.models = get_furthest_model(model_dir)
+        return self.load_model(furthest_model)
 
     def setup_training(self, optimizer, lr, momentum):
         assert self.model is not None
@@ -193,19 +182,23 @@ class Trainer(object):
             self.optimizer.step()
         train_timer.report()
 
-    def iterate_batch(self, mode, batch_size):
+    def iterate_batch(self, mode, batch_size, pre):
         if mode == 'dev':
-            return self.data.dev_batch_sample, ceil(
-                self.data.nb_dev / batch_size)
+            if pre:
+                return self.data.pretrain_dev_batch_sample, ceil(
+                    self.data.nb_pretrain_dev / batch_size)
+            else:
+                return self.data.train_dev_batch_sample, ceil(
+                    self.data.nb_train_dev / batch_size)
         elif mode == 'test':
             return self.data.test_batch_sample, ceil(
                 self.data.nb_test / batch_size)
         else:
             raise ValueError(f'wrong mode: {mode}')
 
-    def calc_loss(self, mode, batch_size, epoch_idx=-1):
+    def calc_loss(self, mode, batch_size, epoch_idx, pre):
         self.model.eval()
-        sampler, nb_batch = self.iterate_batch(mode, batch_size)
+        sampler, nb_batch = self.iterate_batch(mode, batch_size, pre)
         loss, cnt = 0, 0
         for src, src_mask, trg, _ in tqdm(sampler(batch_size), total=nb_batch):
             out = self.model(src, src_mask, trg)
@@ -217,17 +210,20 @@ class Trainer(object):
             mode, loss, epoch_idx)
         return loss
 
-    def iterate_instance(self, mode):
+    def iterate_instance(self, mode, pre):
         if mode == 'dev':
-            return self.data.dev_sample, self.data.nb_dev
+            if pre:
+                return self.data.pretrain_dev_sample, self.data.nb_pretrain_dev
+            else:
+                return self.data.train_dev_sample, self.data.nb_train_dev
         elif mode == 'test':
             return self.data.test_sample, self.data.nb_test
         else:
             raise ValueError(f'wrong mode: {mode}')
 
-    def evaluate(self, mode, epoch_idx=-1, decode_fn=decode_greedy):
+    def evaluate(self, mode, epoch_idx, pre, decode_fn=decode_greedy):
         self.model.eval()
-        sampler, nb_instance = self.iterate_instance(mode)
+        sampler, nb_instance = self.iterate_instance(mode, pre)
         results = self.evaluator.evaluate_all(sampler, nb_instance, self.model,
                                               decode_fn)
         for result in results:
@@ -235,10 +231,10 @@ class Trainer(object):
                              result.long_desc, result.res, epoch_idx)
         return results
 
-    def decode(self, mode, write_fp, decode_fn=decode_greedy):
+    def decode(self, mode, write_fp, pre, decode_fn=decode_greedy):
         self.model.eval()
         cnt = 0
-        sampler, nb_instance = self.iterate_instance(mode)
+        sampler, nb_instance = self.iterate_instance(mode, pre)
         with open(f'{write_fp}.{mode}.guess', 'w') as out_fp, \
              open(f'{write_fp}.{mode}.gold', 'w') as trg_fp:
             for src, trg in tqdm(sampler(), total=nb_instance):
@@ -274,7 +270,7 @@ class Trainer(object):
         torch.save(self.model, open(fp, 'wb'))
         self.models.append((fp, devloss, eval_res))
 
-    def reload_and_test(self, model_fp, batch_size, best_acc):
+    def reload_and_test(self, model_fp, batch_size):
         best_fp, _, best_res = self.models[0]
         best_acc_fp, _, best_acc = self.models[0]
         best_devloss_fp, best_devloss, _ = self.models[0]
@@ -292,15 +288,15 @@ class Trainer(object):
         self.logger.info(f'loading {best_fp} for testing')
         self.load_model(best_fp)
         self.logger.info('decoding dev set')
-        self.decode(DEV, f'{model_fp}.decode')
+        self.decode(DEV, f'{model_fp}.decode', pre=False)
         if self.data.test_file is not None:
-            self.calc_loss(TEST, batch_size)
+            self.calc_loss(TEST, batch_size, pre=False)
             self.logger.info('decoding test set')
-            self.decode(TEST, f'{model_fp}.decode')
-            results = self.evaluate(TEST)
+            self.decode(TEST, f'{model_fp}.decode', pre=False)
+            results = self.evaluate(TEST, pre=False)
             results = ' '.join([f'{r.desc} {r.res}' for r in results])
             self.logger.info(f'TEST {model_fp.split("/")[-1]} {results}')
-        return set([best_fp])
+        return {best_fp}
 
     def cleanup(self, saveall, save_fps, model_fp):
         if not saveall:
@@ -309,6 +305,28 @@ class Trainer(object):
                     continue
                 os.remove(fp)
         os.remove(f'{model_fp}.progress')
+
+
+def get_furthest_model(model_dir):
+    models = []
+    for model in glob.glob(f'{model_dir}/model.nll*'):
+        res = re.findall(r'\w*_\d+\.?\d*', model)
+        loss_, evals_, epoch_ = res[0].split('_'), res[1:-1], res[-1].split('_')
+        assert loss_[0] == 'nll' and epoch_[0] == 'epoch'
+        loss, epoch = float(loss_[1]), int(epoch_[1])
+        evals = []
+        for ev in evals_:
+            ev = ev.split('_')
+            evals.append(util.Eval(ev[0], ev[0], float(ev[1])))
+        models.append((epoch, (model, loss, evals)))
+    models = [x[1] for x in sorted(models)]
+    return (models[-1][0] if len(models) > 0 else None), models
+
+
+def get_model_dirs(arch, source_lang, target_lang):
+    pretrain_model_dir = f"model/tag-{arch}/{source_lang}" if source_lang else None
+    train_model_dir = pretrain_model_dir + "-" + target_lang if source_lang else f"model/tag-{arch}/none-{target_lang}"
+    return pretrain_model_dir, train_model_dir
 
 
 class Multitrainer:
@@ -356,8 +374,7 @@ class Multitrainer:
 
         assert(source_lang is None or source_lang in self.langs)
         assert(target_lang in self.langs)
-        pretrain_model_dir = f"model/tag-{self.arch}/{source_lang}" if source_lang else None
-        train_model_dir = pretrain_model_dir + "-" + target_lang if source_lang else f"model/tag-{self.arch}/none-{target_lang}"
+        pretrain_model_dir, train_model_dir = get_model_dirs(self.arch, source_lang, target_lang)
 
         if source_lang and not os.path.exists(pretrain_model_dir):
             os.makedirs(pretrain_model_dir)
@@ -375,25 +392,17 @@ class Multitrainer:
                           src_vocab=self.src_vocab, trg_vocab=self.trg_vocab)
         trainer.setup_evalutator()
 
-        pretrain_model_filenames = [f for f in os.listdir(pretrain_model_dir) if re.fullmatch(r"model\.nll.+epoch_\d+", f)] if source_lang else None
-        train_model_filenames = [f for f in os.listdir(train_model_dir) if re.fullmatch(r"model\.nll.+epoch_\d+", f)]
-
-        if len(train_model_filenames) > 0:
-            print(train_model_filenames)
-            train_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
-            furthest_model = train_model_filenames[-1]
+        if get_furthest_model(train_model_dir)[0]:
             pretrain_start_epoch = self.pretrain_epochs
-            train_start_epoch = trainer.smart_load_model(os.path.join(train_model_dir, "model")) + 1
+            train_start_epoch = trainer.smart_load_model(train_model_dir) + 1
 
             logger.info('continue training from epoch %d', train_start_epoch)
             trainer.setup_training(self.optimizer, self.lr, self.momentum)
             trainer.setup_scheduler(self.min_lr, self.patience, self.cooldown, self.discount_factor)
             trainer.load_training(train_model_dir)
 
-        elif source_lang and len(pretrain_model_filenames) > 0:
-            pretrain_model_filenames.sort(key=lambda filename: int(filename.split("_")[-1]))
-            furthest_model = pretrain_model_filenames[-1]
-            pretrain_start_epoch = trainer.smart_load_model(os.path.join(pretrain_model_dir, "model")) + 1
+        elif source_lang and get_furthest_model(pretrain_model_dir)[0]:
+            pretrain_start_epoch = trainer.smart_load_model(pretrain_model_dir) + 1
             train_start_epoch = 0
 
             logger.info('continue pretraining from epoch %d', pretrain_start_epoch)
@@ -402,10 +411,6 @@ class Multitrainer:
             trainer.load_training(pretrain_model_dir)
 
         else:
-            print(source_lang)
-            print(os.listdir(pretrain_model_dir))
-            print([re.fullmatch(r"model\.nll.+epoch_\d+", f) for f in os.listdir(pretrain_model_dir)])
-            print(pretrain_model_filenames)
             logger.info("Creating model from scratch")
             pretrain_start_epoch = 0 if source_lang else self.pretrain_epochs
             train_start_epoch = 0
@@ -425,8 +430,8 @@ class Multitrainer:
         for epoch_idx in range(pretrain_start_epoch, self.pretrain_epochs):
             trainer.train(epoch_idx, self.bs, self.max_norm, pre=True)
             with torch.no_grad():
-                devloss = trainer.calc_loss(DEV, self.bs, epoch_idx)
-                eval_res = trainer.evaluate(DEV, epoch_idx)
+                devloss = trainer.calc_loss(DEV, self.bs, epoch_idx, pre=True)
+                eval_res = trainer.evaluate(DEV, epoch_idx, pre=True)
             if trainer.update_lr_and_stop_early(epoch_idx, devloss, self.estop):
                 break
             fp = os.path.join(pretrain_model_dir, "model")
@@ -436,8 +441,8 @@ class Multitrainer:
         for epoch_idx in range(train_start_epoch, self.train_epochs):
             trainer.train(epoch_idx, self.bs, self.max_norm, pre=False)
             with torch.no_grad():
-                devloss = trainer.calc_loss(DEV, self.bs, epoch_idx)
-                eval_res = trainer.evaluate(DEV, epoch_idx)
+                devloss = trainer.calc_loss(DEV, self.bs, epoch_idx, pre=False)
+                eval_res = trainer.evaluate(DEV, epoch_idx, pre=False)
             if trainer.update_lr_and_stop_early(epoch_idx, devloss, self.estop):
                 break
             fp = os.path.join(train_model_dir, "model")
@@ -445,6 +450,6 @@ class Multitrainer:
             trainer.save_training(fp)
 
         with torch.no_grad():
-            save_fps = trainer.reload_and_test(os.path.join(train_model_dir, "model"), self.bs, self.bestacc)
+            save_fps = trainer.reload_and_test(os.path.join(train_model_dir, "model"), self.bs)
 
         # trainer.cleanup(saveall, save_fps, os.path.join(train_model_dir, "model"))
